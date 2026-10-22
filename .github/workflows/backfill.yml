@@ -1,0 +1,79 @@
+name: backfill
+
+# Manual, one-off deep history load. Never scheduled: this is the only job
+# that writes historical rows and it is expected to be slow.
+on:
+  workflow_dispatch:
+    inputs:
+      exchange:
+        description: "Which exchange to bootstrap"
+        type: choice
+        options: [binance, bybit, both]
+        default: binance
+      months:
+        description: "How many full months back to load"
+        type: string
+        default: "12"
+      symbols:
+        description: "Comma-separated symbols"
+        type: string
+        default: "BTCUSDT,ETHUSDT,SOLUSDT"
+      dry_run:
+        description: "Parse and count only, do not write"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: backfill
+  cancel-in-progress: false
+
+jobs:
+  backfill:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    env:
+      PYTHONPATH: src
+      COLLECTOR_SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+      COLLECTOR_SUPABASE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e .
+
+      - name: Bootstrap
+        env:
+          BACKFILL_EXCHANGE: ${{ inputs.exchange }}
+          BACKFILL_MONTHS: ${{ inputs.months }}
+          BACKFILL_SYMBOLS: ${{ inputs.symbols }}
+          BACKFILL_DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          args=(--exchange "$BACKFILL_EXCHANGE" --months "$BACKFILL_MONTHS" --symbols "$BACKFILL_SYMBOLS")
+          if [ "$BACKFILL_DRY_RUN" = "true" ]; then
+            args+=(--dry-run)
+          fi
+          python scripts/bootstrap_history.py "${args[@]}"
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "## backfill"
+            echo ""
+            echo "- exchange: ${{ inputs.exchange }}"
+            echo "- months: ${{ inputs.months }}"
+            echo "- symbols: ${{ inputs.symbols }}"
+            echo "- dry run: ${{ inputs.dry_run }}"
+            echo "- conclusion: ${{ job.status }}"
+          } >> "$GITHUB_STEP_SUMMARY"
