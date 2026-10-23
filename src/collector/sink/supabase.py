@@ -2,84 +2,94 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from typing import Any
 
 import httpx
 
-from .base import Sink
-
 log = logging.getLogger(__name__)
 
-CHUNK = 500
 
-
-class SupabaseSink(Sink):
-    """Batched PostgREST upsert with ON CONFLICT DO NOTHING.
-
-    ``Prefer: resolution=ignore-duplicates`` is PostgREST's way of saying
-    "ON CONFLICT DO NOTHING": the row is inserted once and silently skipped
-    afterwards. That is the only deduplication guarantee in the system that
-    actually holds under concurrency.
-    """
-
+class SupabaseSink:
     def __init__(
         self,
         url: str,
         key: str,
-        table: str = "ohlcv",
+        client: httpx.AsyncClient,
         *,
-        client: httpx.AsyncClient | None = None,
-        max_retries: int = 3,
-        timeout: float = 20.0,
+        max_retries: int = 5,
     ) -> None:
-        self._url = f"{url.rstrip('/')}/rest/v1/{table}"
-        self._headers = {
-            "apikey": key,
-            "Authorization": f"Bearer {key}",
-            "Content-Type": "application/json",
-            "Prefer": "resolution=ignore-duplicates,return=minimal",
-        }
-        self._client = client or httpx.AsyncClient(timeout=timeout)
-        self._owns_client = client is None
+        self._url = url.rstrip("/")
+        self._key = key
+        self._client = client
         self._max_retries = max_retries
 
-    async def write(self, rows: list[dict]) -> int:
-        if not rows:
-            return 0
-        accepted = 0
-        for start in range(0, len(rows), CHUNK):
-            chunk = rows[start : start + CHUNK]
-            await self._post(chunk)
-            accepted += len(chunk)
-        return accepted
+    def _headers(self, merge: bool) -> dict[str, str]:
+        resolution = "merge-duplicates" if merge else "ignore-duplicates"
+        return {
+            "apikey": self._key,
+            "Authorization": f"Bearer {self._key}",
+            "Content-Type": "application/json",
+            "Prefer": f"resolution={resolution},return=minimal",
+        }
 
-    async def _post(self, chunk: list[dict]) -> None:
-        last_error: Exception | None = None
+    async def write(self, table: str, rows: list[dict[str, Any]], *, merge: bool) -> None:
+        if not rows:
+            return
+        last: Exception | None = None
         for attempt in range(1, self._max_retries + 1):
             try:
-                response = await self._client.post(self._url, headers=self._headers, json=chunk)
-            except httpx.HTTPError as exc:
-                last_error = exc
-                await asyncio.sleep(min(10.0, 2.0 ** attempt))
-                continue
-
-            if response.status_code in (200, 201, 204):
-                return
-            if response.status_code in (429, 500, 502, 503, 504):
-                delay = min(10.0, 2.0 ** attempt)
-                log.warning("supabase %s, retrying in %.1fs", response.status_code, delay)
-                last_error = httpx.HTTPStatusError(
-                    f"status {response.status_code}: {response.text[:200]}",
-                    request=response.request,
-                    response=response,
+                response = await self._client.post(
+                    f"{self._url}/rest/v1/{table}",
+                    headers=self._headers(merge),
+                    json=rows,
+                    timeout=60,
                 )
-                await asyncio.sleep(delay)
-                continue
+                if response.status_code == 429 or response.status_code >= 500:
+                    raise httpx.HTTPStatusError(
+                        f"supabase transient {response.status_code}",
+                        request=response.request,
+                        response=response,
+                    )
+                response.raise_for_status()
+                return
+            except (httpx.HTTPError, ValueError) as exc:
+                last = exc
+                if attempt == self._max_retries:
+                    break
+                await asyncio.sleep(min(30.0, 2 ** (attempt - 1)))
+        assert last is not None
+        raise last
 
-            # 400/409/422 mean a schema or payload problem: retrying will not help.
-            raise RuntimeError(f"supabase rejected batch ({response.status_code}): {response.text[:300]}")
+    async def latest_ts(self, table: str, exchange: str, symbol: str) -> int | None:
+        response = await self._client.get(
+            f"{self._url}/rest/v1/{table}",
+            headers={
+                "apikey": self._key,
+                "Authorization": f"Bearer {self._key}",
+            },
+            params={
+                "select": "ts",
+                "exchange": f"eq.{exchange}",
+                "symbol": f"eq.{symbol}",
+                "order": "ts.desc",
+                "limit": "1",
+            },
+            timeout=20,
+        )
+        response.raise_for_status()
+        rows = response.json()
+        return int(rows[0]["ts"]) if rows else None
 
-        raise RuntimeError(f"supabase write failed after {self._max_retries} attempts: {last_error}")
-
-    async def close(self) -> None:
-        if self._owns_client:
-            await self._client.aclose()
+    async def rpc(self, name: str, payload: dict[str, Any]) -> Any:
+        response = await self._client.post(
+            f"{self._url}/rest/v1/rpc/{name}",
+            headers={
+                "apikey": self._key,
+                "Authorization": f"Bearer {self._key}",
+                "Content-Type": "application/json",
+            },
+            json=payload,
+            timeout=120,
+        )
+        response.raise_for_status()
+        return response.json() if response.content else None

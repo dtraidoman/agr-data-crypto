@@ -1,8 +1,8 @@
 name: watchdog
 
-# Independent of both collectors. Cron can fire late *and* stop firing
-# silently, so this job is the only component that assumes nothing:
-# it checks the heartbeats and dispatches the collectors through the API.
+# Independent of both collectors. A scheduled workflow can fire late or stop
+# firing silently, so the watchdog checks heartbeats and dispatches the
+# collectors through the GitHub API. Token-triggered dispatches do start runs.
 on:
   schedule:
     - cron: "*/15 * * * *"
@@ -10,8 +10,6 @@ on:
 
 permissions:
   contents: read
-  # Required to call POST /actions/workflows/{file}/dispatches. This is the
-  # documented exception where GITHUB_TOKEN-triggered events do start runs.
   actions: write
 
 concurrency:
@@ -24,23 +22,18 @@ jobs:
     timeout-minutes: 5
     env:
       COLLECTOR_REDIS_URL: ${{ secrets.UPSTASH_REDIS_URL }}
-      COLLECTOR_TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-      COLLECTOR_TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
       GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      # Stale cursor threshold; a 1m stream should never be older than this.
-      WATCHDOG_STALE_MINUTES: "15"
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v7
+      - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
           cache: pip
           cache-dependency-path: requirements.txt
 
       - name: Install
-        # Deliberately not the package itself: the watchdog must still run if
-        # collector code is broken, so it only needs its two HTTP clients.
+        # The watchdog must run even if the collector package is broken.
         run: pip install -r requirements.txt
 
       - name: Check and revive

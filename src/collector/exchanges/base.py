@@ -4,57 +4,44 @@ import asyncio
 from collections.abc import Callable, Sequence
 from typing import Protocol
 
-from ..models import Candle, Stream
+from ..models import Liquidation, LongShort, OpenInterest, Trade
 
 
-class ExchangeAdapter(Protocol):
+class RestAdapter(Protocol):
     name: str
 
-    async def stream_klines(
+    async def fetch_open_interest(
+        self, symbol: str, start_ms: int, end_ms: int
+    ) -> list[OpenInterest]: ...
+
+    async def fetch_long_short(
+        self, symbol: str, start_ms: int, end_ms: int
+    ) -> list[LongShort]: ...
+
+    async def fetch_recent_trades(
+        self, symbol: str, start_ms: int, end_ms: int
+    ) -> list[Trade]: ...
+
+
+class WsAdapter(Protocol):
+    name: str
+
+    async def stream_trades(
         self,
         symbols: Sequence[str],
-        interval: str,
-        on_candle: Callable[[Candle], None],
+        on_trade: Callable[[Trade], None],
         stop: asyncio.Event,
+        connected: asyncio.Event | None = None,
     ) -> None: ...
 
-    async def backfill_klines(self, stream: Stream, start_ms: int, end_ms: int) -> list[Candle]: ...
-
-
-class CompositeAdapter:
-    """Pairs a websocket feed with a REST catch-up client under one name."""
-
-    def __init__(self, name: str, ws: ExchangeAdapter, rest: ExchangeAdapter) -> None:
-        self.name = name
-        self._ws = ws
-        self._rest = rest
-
-    async def stream_klines(
+    async def stream_liquidations(
         self,
         symbols: Sequence[str],
-        interval: str,
-        on_candle: Callable[[Candle], None],
+        on_liquidation: Callable[[Liquidation], None],
         stop: asyncio.Event,
-    ) -> None:
-        await self._ws.stream_klines(symbols, interval, on_candle, stop)
-
-    async def backfill_klines(self, stream: Stream, start_ms: int, end_ms: int) -> list[Candle]:
-        return await self._rest.backfill_klines(stream, start_ms, end_ms)
+        connected: asyncio.Event | None = None,
+    ) -> None: ...
 
 
-def backoff_seconds(
-    attempt: int,
-    *,
-    base: float = 1.0,
-    cap: float = 30.0,
-    jitter: float = 0.25,
-) -> float:
-    """Exponential backoff with jitter, capped.
-
-    Jitter matters on GitHub runners: without it, two roles reconnecting after
-    a network blip can synchronise their attempts and look like a flood.
-    """
-    import random
-
-    raw = min(cap, base * (2 ** max(0, attempt - 1)))
-    return raw * (1.0 + random.uniform(-jitter, jitter))
+def backoff_seconds(attempt: int, maximum: int = 30) -> float:
+    return min(maximum, 2 ** min(attempt, 6))

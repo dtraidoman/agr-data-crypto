@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import time
+from datetime import UTC, date, datetime, timedelta
 
 INTERVAL_MS: dict[str, int] = {
     "1m": 60_000,
@@ -15,20 +15,34 @@ INTERVAL_MS: dict[str, int] = {
 
 
 def now_ms() -> int:
-    return int(time.time() * 1000)
+    return int(datetime.now(tz=UTC).timestamp() * 1000)
 
 
-def interval_ms(interval: str) -> int:
-    try:
-        return INTERVAL_MS[interval]
-    except KeyError as exc:
-        raise ValueError(f"unsupported interval: {interval!r}") from exc
+def floor_ms(ts_ms: int, step_ms: int) -> int:
+    return ts_ms // step_ms * step_ms
 
 
-def last_closed_open_time(ts_ms: int, iv_ms: int) -> int:
-    """open_time of the most recent candle that has already closed."""
-    return (ts_ms // iv_ms - 1) * iv_ms
+def utc_day_start_ms(day: date) -> int:
+    return int(datetime(day.year, day.month, day.day, tzinfo=UTC).timestamp() * 1000)
 
 
-def candle_is_closed(open_time: int, iv_ms: int, ts_ms: int) -> bool:
-    return open_time + iv_ms <= ts_ms
+def utc_dates(start_ms: int, end_ms: int) -> list[date]:
+    start = datetime.fromtimestamp(start_ms / 1000, tz=UTC).date()
+    end = datetime.fromtimestamp(end_ms / 1000, tz=UTC).date()
+    out: list[date] = []
+    current = start
+    while current <= end:
+        out.append(current)
+        current += timedelta(days=1)
+    return out
+
+
+def iso_to_ms(value: str) -> int:
+    parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
+    return int(parsed.timestamp() * 1000)
+
+
+def ms_to_iso(ts_ms: int) -> str:
+    return datetime.fromtimestamp(ts_ms / 1000, tz=UTC).isoformat()

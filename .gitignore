@@ -10,3 +10,5 @@ dist/
 *.egg-info/
 data/
 *.parquet
+*.log
+opencode.json

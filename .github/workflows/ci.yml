@@ -18,9 +18,9 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v7
+      - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
           cache: pip
@@ -34,7 +34,7 @@ jobs:
       - name: Lint
         run: ruff check .
 
-      - name: Workflow YAML
+      - name: Workflow definitions
         run: python scripts/check_workflows.py
 
       - name: Tests

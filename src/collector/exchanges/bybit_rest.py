@@ -6,16 +6,19 @@ from typing import Any
 
 import httpx
 
-from ..models import Candle, Stream
+from ..models import LongShort, OpenInterest, Trade
 from ..timeutil import now_ms
-from .parsers import bybit_interval_code, parse_bybit_rest_klines
+from .parsers import (
+    parse_bybit_long_short,
+    parse_bybit_open_interest,
+    parse_bybit_trade,
+)
 from .ratelimit import AsyncRateLimiter
 
 log = logging.getLogger(__name__)
 
-# Bybit: 403 "access too frequent" is followed by a 10 minute IP ban.
-# Retrying immediately turns a short hiccup into a 10 minute outage.
-RATE_LIMITED_CODES = {10006, 10018}
+PERIOD_MS = 300_000
+RATE_LIMIT_CODES = {10006, 10018}
 
 
 class BybitRest:
@@ -27,91 +30,121 @@ class BybitRest:
         client: httpx.AsyncClient,
         limiter: AsyncRateLimiter,
         *,
-        max_pages: int = 10,
-        max_retries: int = 3,
+        max_retries: int = 4,
+        max_pages: int = 30,
     ) -> None:
         self._client = client
         self._limiter = limiter
-        self._max_pages = max_pages
         self._max_retries = max_retries
+        self._max_pages = max_pages
 
     async def _get(self, path: str, params: dict[str, Any]) -> dict[str, Any]:
         url = f"{self.BASE}{path}"
-        last_error: Exception | None = None
+        last: Exception | None = None
         for attempt in range(1, self._max_retries + 1):
             await self._limiter.wait()
             try:
                 response = await self._client.get(url, params=params)
-            except httpx.HTTPError as exc:
-                last_error = exc
-                await asyncio.sleep(min(30.0, 2.0 ** attempt))
-                continue
+                if response.status_code == 429 or response.status_code >= 500:
+                    raise httpx.HTTPStatusError(
+                        f"bybit transient {response.status_code}",
+                        request=response.request,
+                        response=response,
+                    )
+                response.raise_for_status()
+                body = response.json()
+                code = int(body.get("retCode", 0))
+                if code in RATE_LIMIT_CODES:
+                    raise httpx.HTTPStatusError(
+                        f"bybit rate limit {code}",
+                        request=response.request,
+                        response=response,
+                    )
+                if code != 0:
+                    raise ValueError(f"bybit retCode={code}: {body.get('retMsg')}")
+                return body.get("result", {})
+            except (httpx.HTTPError, ValueError) as exc:
+                last = exc
+                if attempt == self._max_retries:
+                    break
+                await asyncio.sleep(min(15.0, 3 ** (attempt - 1)))
+        assert last is not None
+        raise last
 
-            if response.status_code in (403, 429):
-                delay = _retry_after(response, attempt)
-                log.warning("bybit throttled (%s), sleeping %.1fs", response.status_code, delay)
-                await asyncio.sleep(delay)
-                continue
-            if response.status_code >= 500:
-                last_error = httpx.HTTPStatusError("server error", request=response.request, response=response)
-                await asyncio.sleep(min(30.0, 2.0 ** attempt))
-                continue
+    @staticmethod
+    def _closed(end_ms: int) -> int:
+        return min(end_ms, now_ms() - PERIOD_MS)
 
-            response.raise_for_status()
-            payload = response.json()
-            if int(payload.get("retCode", 0)) != 0:
-                code = int(payload.get("retCode", -1))
-                last_error = RuntimeError(f"bybit retCode={code}: {payload.get('retMsg')}")
-                if code in RATE_LIMITED_CODES:
-                    await asyncio.sleep(min(60.0, 2.0 ** attempt))
-                    continue
-                raise last_error
-            return payload
-
-        raise RuntimeError(f"bybit request failed after {self._max_retries} attempts: {last_error}")
-
-    async def backfill_klines(self, stream: Stream, start_ms: int, end_ms: int) -> list[Candle]:
-        """Walk a window backwards.
-
-        Bybit ignores ``start`` as a paging cursor: whatever the window is, it
-        returns the *newest* ``limit`` candles inside it, descending. Forward
-        paging with ``start = last + iv`` would therefore skip everything but
-        the tail of each window. Paging backwards via ``end = oldest - 1`` is
-        the only way to cover the whole range.
-        """
-        collected: list[Candle] = []
-        end = end_ms
-        for _page in range(self._max_pages):
-            payload = await self._get(
-                "/v5/market/kline",
+    async def fetch_open_interest(
+        self, symbol: str, start_ms: int, end_ms: int
+    ) -> list[OpenInterest]:
+        out: list[OpenInterest] = []
+        end = self._closed(end_ms)
+        cursor = end
+        for _ in range(self._max_pages):
+            result = await self._get(
+                "/v5/market/open-interest",
                 {
-                    "category": "spot",
-                    "symbol": stream.symbol,
-                    "interval": bybit_interval_code(stream.interval),
-                    "start": start_ms,
-                    "end": end,
-                    "limit": 1000,
+                    "category": "linear",
+                    "symbol": symbol,
+                    "intervalTime": "5min",
+                    "startTime": start_ms,
+                    "endTime": cursor,
+                    "limit": 200,
                 },
             )
-            ts = now_ms()
-            candles = parse_bybit_rest_klines(payload, stream.symbol, stream.interval, ts)
-            candles = [c for c in candles if start_ms <= c.open_time <= end]
-            if not candles:
+            rows = parse_bybit_open_interest(result, symbol)
+            rows = [row for row in rows if start_ms <= row.ts <= end]
+            out.extend(rows)
+            all_rows = parse_bybit_open_interest(result, symbol)
+            if len(all_rows) < 200 or not all_rows:
                 break
-            collected.extend(candles)
-            first_open = candles[0].open_time
-            if first_open <= start_ms:
+            oldest = min(row.ts for row in all_rows)
+            if oldest <= start_ms:
                 break
-            end = first_open - 1
+            cursor = oldest - 1
+        return sorted({row.ts: row for row in out}.values(), key=lambda row: row.ts)
 
-        deduped = {candle.pk: candle for candle in collected}
-        return sorted(deduped.values(), key=lambda candle: candle.open_time)
+    async def fetch_long_short(
+        self, symbol: str, start_ms: int, end_ms: int
+    ) -> list[LongShort]:
+        out: list[LongShort] = []
+        end = self._closed(end_ms)
+        cursor = end
+        for _ in range(self._max_pages):
+            result = await self._get(
+                "/v5/market/account-ratio",
+                {
+                    "category": "linear",
+                    "symbol": symbol,
+                    "period": "5min",
+                    "startTime": start_ms,
+                    "endTime": cursor,
+                    "limit": 500,
+                },
+            )
+            rows = parse_bybit_long_short(result, symbol)
+            rows = [row for row in rows if start_ms <= row.ts <= end]
+            out.extend(rows)
+            all_rows = parse_bybit_long_short(result, symbol)
+            if len(all_rows) < 500 or not all_rows:
+                break
+            oldest = min(row.ts for row in all_rows)
+            if oldest <= start_ms:
+                break
+            cursor = oldest - 1
+        return sorted({row.key: row for row in out}.values(), key=lambda row: row.key)
 
-
-def _retry_after(response: httpx.Response, attempt: int) -> float:
-    raw = response.headers.get("Retry-After")
-    try:
-        value = float(raw) if raw is not None else 2.0 ** attempt
-    except ValueError:
-        value = 2.0 ** attempt
-    return max(0.5, min(60.0, value))
+    async def fetch_recent_trades(
+        self, symbol: str, start_ms: int, end_ms: int
+    ) -> list[Trade]:
+        result = await self._get(
+            "/v5/market/recent-trade",
+            {"category": "linear", "symbol": symbol, "limit": 1000},
+        )
+        out: list[Trade] = []
+        for item in result.get("list", []):
+            trade = parse_bybit_trade(item, symbol)
+            if start_ms <= trade.ts <= min(end_ms, now_ms()):
+                out.append(trade)
+        return sorted({trade.trade_id: trade for trade in out}.values(), key=lambda trade: trade.ts)

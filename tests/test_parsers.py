@@ -1,159 +1,129 @@
-from __future__ import annotations
-
-import json
-
-from collector.timeutil import last_closed_open_time
-
-OPEN = 1_699_999_980_000
-IV = 60_000
-CLOSED_NOW = OPEN + 2 * IV + 30_000
-
-
-def _binance_row(open_time: int, close_time: int, price: str = "100.0") -> list:
-    return [
-        open_time,
-        price,
-        "101.0",
-        "99.0",
-        "100.5",
-        "10.0",
-        close_time,
-        "1005.0",
-        42,
-        "5.0",
-        "500.0",
-        "0",
-    ]
+from collector.exchanges.parsers import (
+    parse_binance_agg_trade,
+    parse_binance_force_order,
+    parse_binance_long_short,
+    parse_binance_open_interest,
+    parse_bybit_liquidation,
+    parse_bybit_long_short,
+    parse_bybit_open_interest,
+    parse_bybit_trade,
+)
 
 
-def test_binance_rest_drops_in_progress_candle():
-    from collector.exchanges.parsers import parse_binance_rest_klines
+def test_binance_open_interest():
+    rows = parse_binance_open_interest(
+        [
+            {
+                "symbol": "BTCUSDT",
+                "sumOpenInterest": "123.5",
+                "sumOpenInterestValue": "1000000.5",
+                "timestamp": 1700000000000,
+            }
+        ],
+        "BTCUSDT",
+    )
+    assert rows[0].open_interest == 123.5
+    assert rows[0].open_interest_value == 1000000.5
+    assert rows[0].ts == 1700000000000
 
+
+def test_binance_long_short_variants():
     payload = [
-        _binance_row(OPEN, OPEN + IV - 1),
-        _binance_row(OPEN + IV, OPEN + 2 * IV - 1, "101.0"),
-        # still forming: close_time is in the future relative to CLOSED_NOW
-        _binance_row(OPEN + 2 * IV, OPEN + 3 * IV - 1, "102.0"),
+        {
+            "longAccount": "0.6",
+            "shortAccount": "0.4",
+            "longShortRatio": "1.5",
+            "timestamp": 1700000000000,
+        }
     ]
-    candles = parse_binance_rest_klines(payload, "BTCUSDT", "1m", CLOSED_NOW)
-
-    assert [c.open_time for c in candles] == [OPEN, OPEN + IV]
-    assert candles[0].close == 100.5
-    assert candles[0].quote_volume == 1005.0
-    assert candles[0].trades == 42
-    assert all(c.is_closed for c in candles)
+    rows = parse_binance_long_short(payload, "BTCUSDT", "global_account")
+    assert rows[0].long_value == 0.6
+    assert rows[0].ratio == 1.5
+    assert rows[0].unit == "fraction"
 
 
-def test_binance_ws_ignores_partial_updates():
-    from collector.exchanges.parsers import parse_binance_ws_kline
-
-    def message(closed: bool) -> str:
-        return json.dumps(
-            {
-                "stream": "btcusdt@kline_1m",
-                "data": {
-                    "e": "kline",
-                    "s": "BTCUSDT",
-                    "k": {
-                        "t": OPEN,
-                        "T": OPEN + IV - 1,
-                        "i": "1m",
-                        "o": "100.0",
-                        "h": "101.0",
-                        "l": "99.0",
-                        "c": "100.5",
-                        "v": "10.0",
-                        "q": "1005.0",
-                        "n": 42,
-                        "x": closed,
-                    },
-                },
-            }
-        )
-
-    assert parse_binance_ws_kline(message(False), CLOSED_NOW) is None
-    candle = parse_binance_ws_kline(message(True), CLOSED_NOW)
-    assert candle is not None
-    assert candle.symbol == "BTCUSDT"
-    assert candle.interval == "1m"
-    assert candle.open_time == OPEN
+def test_binance_taker_volume():
+    payload = [
+        {
+            "buyVol": "10",
+            "sellVol": "5",
+            "buySellRatio": "2",
+            "timestamp": 1700000000000,
+        }
+    ]
+    rows = parse_binance_long_short(payload, "BTCUSDT", "taker_volume")
+    assert rows[0].unit == "base_volume"
+    assert rows[0].long_value == 10
+    assert rows[0].short_value == 5
 
 
-def test_binance_ws_ignores_non_kline_frames():
-    from collector.exchanges.parsers import parse_binance_ws_kline
-
-    assert parse_binance_ws_kline(json.dumps({"result": None, "id": 1}), CLOSED_NOW) is None
-    assert parse_binance_ws_kline(b"not json", CLOSED_NOW) is None
-
-
-def test_bybit_rest_returns_ascending_and_drops_open_head():
-    from collector.exchanges.parsers import parse_bybit_rest_klines
-
-    # The real endpoint returns arrays of strings, newest first:
-    # [start, open, high, low, close, volume, turnover].
-    def row(start: int, close: str) -> list[str]:
-        return [str(start), "100.0", "101.0", "99.0", close, "10.0", "1005.0"]
-
-    payload = {
-        "retCode": 0,
-        "result": {
-            "symbol": "BTCUSDT",
-            "category": "spot",
-            "list": [
-                row(OPEN + 2 * IV, "102.0"),
-                row(OPEN + IV, "101.0"),
-                row(OPEN, "100.5"),
-            ],
-        },
-    }
-
-    candles = parse_bybit_rest_klines(payload, "BTCUSDT", "1m", CLOSED_NOW)
-
-    assert [c.open_time for c in candles] == [OPEN, OPEN + IV]
-    assert [c.close for c in candles] == [100.5, 101.0]
-    assert candles[0].close_time == OPEN + IV - 1
-    assert candles[0].quote_volume == 1005.0
+def test_binance_agg_trade_side():
+    trade = parse_binance_agg_trade(
+        {"e": "aggTrade", "s": "BTCUSDT", "a": 7, "p": "100", "q": "0.5", "T": 1700000000000, "m": True}
+    )
+    assert trade.side == "sell"
+    assert trade.notional == 50
 
 
-def test_bybit_ws_requires_confirm():
-    from collector.exchanges.parsers import parse_bybit_ws_kline
-
-    def frame(confirm: bool) -> str:
-        return json.dumps(
-            {
-                "topic": "kline.1.BTCUSDT",
-                "data": [
-                    {
-                        "start": str(OPEN),
-                        "end": str(OPEN + IV - 1),
-                        "interval": "1",
-                        "open": "100.0",
-                        "close": "100.5",
-                        "high": "101.0",
-                        "low": "99.0",
-                        "volume": "10.0",
-                        "turnover": "1005.0",
-                        "confirm": confirm,
-                    }
-                ],
-            }
-        )
-
-    assert parse_bybit_ws_kline(frame(False), CLOSED_NOW) is None
-    candle = parse_bybit_ws_kline(frame(True), CLOSED_NOW)
-    assert candle is not None
-    assert candle.exchange == "bybit"
-    assert candle.interval == "1m"
+def test_binance_agg_trade_rest_payload_has_no_symbol():
+    trade = parse_binance_agg_trade(
+        {"a": 8, "p": "100", "q": "1", "T": 1700000000000, "m": False},
+        "ETHUSDT",
+    )
+    assert trade.symbol == "ETHUSDT"
+    assert trade.side == "buy"
 
 
-def test_bybit_ws_pong_is_ignored():
-    from collector.exchanges.parsers import parse_bybit_ws_kline
+def test_binance_force_order():
+    event = parse_binance_force_order(
+        {
+            "e": "forceOrder",
+            "E": 1700000000000,
+            "o": {
+                "s": "BTCUSDT",
+                "S": "SELL",
+                "q": "1",
+                "p": "100",
+                "ap": "99",
+                "z": "1",
+                "T": 1700000000000,
+            },
+        }
+    )
+    assert event.position_side == "long"
+    assert event.notional == 99
+    assert event.event_id
 
-    assert parse_bybit_ws_kline(json.dumps({"op": "pong"}), CLOSED_NOW) is None
-    assert parse_bybit_ws_kline(json.dumps({"success": True, "op": "subscribe"}), CLOSED_NOW) is None
+
+def test_bybit_open_interest_and_ratio():
+    oi = parse_bybit_open_interest(
+        {"list": [{"openInterest": "10", "timestamp": "1700000000000"}]}, "ETHUSDT"
+    )
+    assert oi[0].open_interest == 10
+    ratio = parse_bybit_long_short(
+        {"list": [{"buyRatio": "0.7", "sellRatio": "0.3", "timestamp": "1700000000000"}]},
+        "ETHUSDT",
+    )
+    assert ratio[0].long_value == 0.7
+    assert ratio[0].ratio == 0.7 / 0.3
 
 
-def test_last_closed_open_time():
-    assert last_closed_open_time(OPEN + 30_000, IV) == OPEN - IV
-    assert last_closed_open_time(OPEN, IV) == OPEN - IV
-    assert last_closed_open_time(OPEN + IV, IV) == OPEN
+def test_bybit_trade_and_liquidation():
+    trade = parse_bybit_trade(
+        {"i": "abc", "p": "100", "v": "2", "T": 1700000000000, "S": "Buy"}, "SOLUSDT"
+    )
+    assert trade.side == "buy"
+    assert trade.trade_id == "abc"
+    rest_trade = parse_bybit_trade(
+        {"execId": "rest-1", "price": "101", "size": "3", "time": "1700000000000", "side": "Sell"},
+        "SOLUSDT",
+    )
+    assert rest_trade.trade_id == "rest-1"
+    assert rest_trade.side == "sell"
+    assert rest_trade.notional == 303
+    event = parse_bybit_liquidation(
+        {"T": 1700000000000, "s": "SOLUSDT", "S": "Sell", "v": "2", "p": "100"},
+        "SOLUSDT",
+    )
+    assert event.position_side == "long"
+    assert event.notional == 200

@@ -1,106 +1,78 @@
 from __future__ import annotations
 
-import pytest
-
+from collector.models import OpenInterest
 from collector.pipeline import Pipeline
 from collector.sink.memory import MemorySink
 
 
-async def test_duplicate_rows_are_buffered_once(candle_factory):
+async def test_dedupe_and_flush() -> None:
     sink = MemorySink()
     pipeline = Pipeline(sink, flush_rows=100, flush_interval_sec=60)
-    candle = candle_factory()
+    row = OpenInterest(
+        exchange="binance",
+        symbol="BTCUSDT",
+        ts=1_700_000_000_000,
+        open_interest=10.5,
+        open_interest_value=1_000_000.0,
+    )
 
-    pipeline.add([candle, candle, candle])
+    pipeline.add_model(row, merge=True)
+    pipeline.add_model(row, merge=True)
 
-    assert pipeline.buffered == 1
-    assert pipeline.stats["buffered_duplicates"] == 2
-    assert pipeline.cursors == {}
-
-    written = await pipeline.flush(force=True)
-    assert written == 1
-    assert len(sink.rows) == 1
-    assert pipeline.cursors[candle.stream] == candle.open_time
-
-
-async def test_open_candles_never_reach_the_sink(candle_factory):
-    sink = MemorySink()
-    pipeline = Pipeline(sink, flush_rows=100, flush_interval_sec=60)
-
-    pipeline.add([candle_factory(is_closed=False)])
-
-    assert pipeline.buffered == 0
-    assert await pipeline.flush(force=True) == 0
-    assert sink.rows == {}
+    assert pipeline.pending_rows == 1
+    await pipeline.flush()
+    assert len(sink.rows("deriv_open_interest")) == 1
+    assert pipeline.pending_rows == 0
 
 
-async def test_failed_flush_does_not_advance_cursor(candle_factory):
+async def test_failed_flush_keeps_rows_and_retries() -> None:
     class BrokenSink:
         def __init__(self) -> None:
             self.calls = 0
 
-        async def write(self, rows):
+        async def write(self, table: str, rows: list[dict], *, merge: bool) -> None:
             self.calls += 1
             raise RuntimeError("supabase is down")
 
-        async def close(self) -> None:
-            return None
+    broken = BrokenSink()
+    pipeline = Pipeline(broken, flush_rows=100, flush_interval_sec=60)
+    row = OpenInterest(
+        exchange="bybit",
+        symbol="ETHUSDT",
+        ts=1_700_000_000_000,
+        open_interest=1.0,
+    )
+    pipeline.add_model(row, merge=True)
 
-    sink = BrokenSink()
-    pipeline = Pipeline(sink, flush_rows=100, flush_interval_sec=60)
-    candle = candle_factory()
-    pipeline.add([candle])
+    await pipeline.flush()
 
-    with pytest.raises(RuntimeError):
-        await pipeline.flush(force=True)
+    assert broken.calls == 1
+    assert pipeline.pending_rows == 1
 
-    assert pipeline.cursors == {}
-    assert pipeline.buffered == 1
-    assert pipeline.stats["flush_errors"] == 1
-
-    # The retry succeeds, and only then does the cursor move.
     healthy = MemorySink()
     pipeline._sink = healthy  # noqa: SLF001 - deliberate test seam
-    assert await pipeline.flush(force=True) == 1
-    assert pipeline.cursors[candle.stream] == candle.open_time
+    await pipeline.flush()
+
+    assert pipeline.pending_rows == 0
+    assert len(healthy.rows("deriv_open_interest")) == 1
 
 
-async def test_flush_is_idempotent_across_duplicates(candle_factory):
+async def test_multiple_table_and_merge_modes_are_independent() -> None:
     sink = MemorySink()
-    pipeline = Pipeline(sink, flush_rows=100, flush_interval_sec=60)
-    candle = candle_factory()
+    pipeline = Pipeline(sink, flush_rows=2, flush_interval_sec=60)
+    row = OpenInterest(
+        exchange="binance",
+        symbol="SOLUSDT",
+        ts=1_700_000_000_000,
+        open_interest=2.0,
+    )
 
-    pipeline.add([candle])
-    await pipeline.flush(force=True)
+    pipeline.add_model(row, merge=True)
+    pipeline.add_model(row, merge=False)
+    assert pipeline.pending_rows == 2
 
-    pipeline.add([candle])  # replayed by a successor after a crash
-    await pipeline.flush(force=True)
+    await pipeline.flush()
 
-    assert len(sink.rows) == 1
-    assert sink.duplicates == 1
-    assert pipeline.cursors[candle.stream] == candle.open_time
-
-
-async def test_multiple_streams_track_independent_cursors(candle_factory):
-    sink = MemorySink()
-    pipeline = Pipeline(sink, flush_rows=100, flush_interval_sec=60)
-
-    btc = candle_factory(symbol="BTCUSDT", open_time=60_000)
-    eth = candle_factory(symbol="ETHUSDT", open_time=120_000)
-    pipeline.add([btc, eth])
-    await pipeline.flush(force=True)
-
-    assert pipeline.cursors == {btc.stream: 60_000, eth.stream: 120_000}
-    assert set(sink.rows) == {
-        ("binance", "BTCUSDT", "1m", 60_000),
-        ("binance", "ETHUSDT", "1m", 120_000),
-    }
-
-
-def test_due_respects_threshold(candle_factory):
-    pipeline = Pipeline(MemorySink(), flush_rows=2, flush_interval_sec=3600)
-    assert pipeline.due() is False
-    pipeline.add([candle_factory(open_time=60_000)])
-    assert pipeline.due() is False
-    pipeline.add([candle_factory(open_time=120_000)])
-    assert pipeline.due() is True
+    assert pipeline.pending_rows == 0
+    assert sink.merge_flags == [("deriv_open_interest", True), ("deriv_open_interest", False)]
+    assert len(sink.rows("deriv_open_interest")) == 1

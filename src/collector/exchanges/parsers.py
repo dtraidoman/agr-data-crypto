@@ -1,17 +1,18 @@
-"""Pure parsers: no I/O, no clock, fully unit-testable.
-
-Every parser is responsible for the two classic traps:
-  * drop the *in-progress* candle (Binance REST tail, Bybit REST head);
-  * only accept a candle when the exchange says it is closed (x / confirm).
-"""
+"""Pure exchange payload parsers. No I/O, no clock, easy to unit-test."""
 
 from __future__ import annotations
 
-import json
+import hashlib
 from typing import Any
 
-from ..models import Candle, Trade
-from ..timeutil import candle_is_closed, interval_ms
+from ..models import (
+    Liquidation,
+    LongShort,
+    OpenInterest,
+    Trade,
+    normalize_side,
+    position_side_for,
+)
 
 
 def _f(value: Any) -> float:
@@ -19,220 +20,162 @@ def _f(value: Any) -> float:
 
 
 def _i(value: Any) -> int:
-    return int(value)
+    return int(float(value))
 
 
-# --------------------------------------------------------------------- Binance
-def parse_binance_rest_klines(
-    payload: list[list[Any]], symbol: str, interval: str, ts_ms: int
-) -> list[Candle]:
-    """GET /api/v3/klines -> ascending array of arrays.
+def _ratio(long_value: float, short_value: float) -> float | None:
+    return long_value / short_value if short_value else None
 
-    The last element is the currently forming candle; it must never be
-    persisted, otherwise it stays partial forever.
-    """
-    out: list[Candle] = []
-    iv = interval_ms(interval)
-    for row in payload:
-        open_time = _i(row[0])
-        close_time = _i(row[6])
-        if not candle_is_closed(open_time, iv, ts_ms):
-            continue
+
+def make_event_id(*parts: Any) -> str:
+    canonical = "|".join(str(part) for part in parts)
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:32]
+
+
+def parse_binance_open_interest(payload: list[dict[str, Any]], symbol: str) -> list[OpenInterest]:
+    return [
+        OpenInterest(
+            exchange="binance",
+            symbol=symbol,
+            ts=_i(item["timestamp"]),
+            open_interest=_f(item["sumOpenInterest"]),
+            open_interest_value=_f(item["sumOpenInterestValue"]),
+        )
+        for item in payload
+    ]
+
+
+def parse_binance_long_short(
+    payload: list[dict[str, Any]], symbol: str, kind: str
+) -> list[LongShort]:
+    out: list[LongShort] = []
+    for item in payload:
+        if kind == "taker_volume":
+            long_value, short_value = _f(item["buyVol"]), _f(item["sellVol"])
+            ratio = _f(item.get("buySellRatio") or _ratio(long_value, short_value) or 0)
+            unit = "base_volume"
+        else:
+            long_value, short_value = _f(item["longAccount"]), _f(item["shortAccount"])
+            ratio = _f(item.get("longShortRatio") or _ratio(long_value, short_value) or 0)
+            unit = "fraction"
         out.append(
-            Candle(
+            LongShort(
                 exchange="binance",
                 symbol=symbol,
-                interval=interval,
-                open_time=open_time,
-                close_time=close_time,
-                open=_f(row[1]),
-                high=_f(row[2]),
-                low=_f(row[3]),
-                close=_f(row[4]),
-                volume=_f(row[5]),
-                quote_volume=_f(row[7]) if len(row) > 7 and row[7] is not None else None,
-                trades=_i(row[8]) if len(row) > 8 and row[8] is not None else None,
-                is_closed=True,
-                received_at=ts_ms,
+                kind=kind,
+                ts=_i(item["timestamp"]),
+                long_value=long_value,
+                short_value=short_value,
+                ratio=ratio,
+                unit=unit,
             )
         )
     return out
 
 
-def parse_binance_ws_kline(raw: str | bytes, ts_ms: int) -> Candle | None:
-    try:
-        message = json.loads(raw)
-    except (ValueError, TypeError):
-        return None
-    payload = message.get("data", message)
-    if payload.get("e") != "kline":
-        return None
-    k = payload.get("k") or {}
-    if not k.get("x"):  # updates every second; only the final one is a candle
-        return None
-    interval = str(k.get("i", "1m"))
-    return Candle(
-        exchange="binance",
-        symbol=str(payload.get("s") or k.get("s") or ""),
-        interval=interval,
-        open_time=_i(k["t"]),
-        close_time=_i(k["T"]),
-        open=_f(k["o"]),
-        high=_f(k["h"]),
-        low=_f(k["l"]),
-        close=_f(k["c"]),
-        volume=_f(k["v"]),
-        quote_volume=_f(k["q"]) if k.get("q") is not None else None,
-        trades=_i(k["n"]) if k.get("n") is not None else None,
-        is_closed=True,
-        received_at=ts_ms,
-    )
-
-
-def parse_binance_ws_aggtrade(raw: str | bytes, ts_ms: int) -> Trade | None:
-    try:
-        message = json.loads(raw)
-    except (ValueError, TypeError):
-        return None
-    payload = message.get("data", message)
-    if payload.get("e") != "aggTrade":
-        return None
+def parse_binance_agg_trade(payload: dict[str, Any], symbol: str | None = None) -> Trade:
+    raw_symbol = payload.get("s") or symbol
+    if not raw_symbol:
+        raise ValueError("binance aggTrade payload has no symbol")
     return Trade(
         exchange="binance",
-        symbol=str(payload.get("s", "")),
-        trade_id=str(payload.get("a")),
+        symbol=str(raw_symbol).upper(),
+        trade_id=str(payload["a"]),
         price=_f(payload["p"]),
         qty=_f(payload["q"]),
         ts=_i(payload["T"]),
-        is_buyer_maker=bool(payload.get("m")),
+        side="sell" if bool(payload["m"]) else "buy",
     )
 
 
-# ----------------------------------------------------------------------- Bybit
-def parse_bybit_rest_klines(
-    payload: dict[str, Any], symbol: str, interval: str, ts_ms: int
-) -> list[Candle]:
-    """GET /v5/market/kline -> result.list is *newest first*.
+def parse_binance_force_order(payload: dict[str, Any]) -> Liquidation:
+    order = payload.get("o", payload)
+    symbol = str(order["s"]).upper()
+    order_side = normalize_side(str(order["S"]))
+    qty = _f(order.get("z") or order.get("q") or 0)
+    avg_price = _f(order.get("ap") or 0)
+    price = avg_price if avg_price > 0 else _f(order.get("p") or 0)
+    ts = _i(order.get("T") or payload.get("E") or 0)
+    return Liquidation(
+        exchange="binance",
+        symbol=symbol,
+        ts=ts,
+        order_side=order_side,
+        position_side=position_side_for(order_side),
+        price=price,
+        qty=qty,
+        notional=price * qty,
+        event_id=make_event_id("binance", symbol, ts, order_side, qty, price),
+    )
 
-    Each row is an array of strings, not an object:
-    ``[start, open, high, low, close, volume, turnover]``.
-    ``end`` is not returned, but it is always ``start + interval - 1``.
-    The first element is the candle currently in progress.
-    """
-    result = payload.get("result") or {}
-    rows = result.get("list") or []
-    iv = interval_ms(interval)
-    out: list[Candle] = []
-    for row in rows:
-        open_time = _i(row[0])
-        if not candle_is_closed(open_time, iv, ts_ms):
-            continue
+
+def parse_bybit_open_interest(result: dict[str, Any], symbol: str) -> list[OpenInterest]:
+    out: list[OpenInterest] = []
+    for item in result.get("list", []):
+        value = item.get("openInterestValue")
         out.append(
-            Candle(
+            OpenInterest(
                 exchange="bybit",
                 symbol=symbol,
-                interval=interval,
-                open_time=open_time,
-                close_time=open_time + iv - 1,
-                open=_f(row[1]),
-                high=_f(row[2]),
-                low=_f(row[3]),
-                close=_f(row[4]),
-                volume=_f(row[5]),
-                quote_volume=_f(row[6]) if len(row) > 6 and row[6] not in (None, "") else None,
-                trades=None,
-                is_closed=True,
-                received_at=ts_ms,
+                ts=_i(item["timestamp"]),
+                open_interest=_f(item["openInterest"]),
+                open_interest_value=_f(value) if value not in (None, "") else None,
             )
         )
-    out.sort(key=lambda candle: candle.open_time)
     return out
 
 
-def parse_bybit_ws_kline(raw: str | bytes, ts_ms: int) -> Candle | None:
-    """Bybit spot sends a snapshot with confirm=false on subscribe.
-
-    Persisting that snapshot is the single most common bug in Bybit
-    collectors: the later confirm=true update would be ignored by an
-    "only closed" filter and the row stays partial forever.
-    """
-    try:
-        message = json.loads(raw)
-    except (ValueError, TypeError):
-        return None
-    topic = str(message.get("topic", ""))
-    if not topic.startswith("kline."):
-        return None
-    parts = topic.split(".")
-    if len(parts) < 3:
-        return None
-    items = message.get("data") or []
-    if not items:
-        return None
-    item = items[-1]
-    if not item.get("confirm"):
-        return None
-    interval = _bybit_interval_to_name(parts[1])
-    return Candle(
-        exchange="bybit",
-        symbol=parts[2],
-        interval=interval,
-        open_time=_i(item["start"]),
-        close_time=_i(item["end"]),
-        open=_f(item["open"]),
-        high=_f(item["high"]),
-        low=_f(item["low"]),
-        close=_f(item["close"]),
-        volume=_f(item["volume"]),
-        quote_volume=_f(item["turnover"]) if item.get("turnover") is not None else None,
-        trades=None,
-        is_closed=True,
-        received_at=ts_ms,
-    )
+def parse_bybit_long_short(result: dict[str, Any], symbol: str) -> list[LongShort]:
+    out: list[LongShort] = []
+    for item in result.get("list", []):
+        long_value, short_value = _f(item["buyRatio"]), _f(item["sellRatio"])
+        out.append(
+            LongShort(
+                exchange="bybit",
+                symbol=symbol,
+                kind="account",
+                ts=_i(item["timestamp"]),
+                long_value=long_value,
+                short_value=short_value,
+                ratio=_ratio(long_value, short_value),
+                unit="fraction",
+            )
+        )
+    return out
 
 
-def parse_bybit_ws_trade(raw: str | bytes, ts_ms: int) -> Trade | None:
-    try:
-        message = json.loads(raw)
-    except (ValueError, TypeError):
-        return None
-    topic = str(message.get("topic", ""))
-    if not topic.startswith("publicTrade."):
-        return None
-    items = message.get("data") or []
-    if not items:
-        return None
-    item = items[-1]
+def parse_bybit_trade(item: dict[str, Any], symbol: str) -> Trade:
+    # WebSocket publicTrade uses short keys; REST recent-trade uses long keys.
+    price = item.get("p", item.get("price"))
+    qty = item.get("v", item.get("size"))
+    ts = item.get("T", item.get("time"))
+    side = item.get("S", item.get("side"))
+    if price is None or qty is None or ts is None or side is None:
+        raise KeyError("bybit trade payload is missing required fields")
     return Trade(
         exchange="bybit",
-        symbol=topic.split(".", 1)[1],
-        trade_id=str(item.get("i")),
-        price=_f(item["p"]),
-        qty=_f(item["v"]),
-        ts=_i(item["T"]),
-        is_buyer_maker=str(item.get("S", "")).lower() == "sell",
+        symbol=symbol,
+        trade_id=str(item.get("i") or item.get("execId") or ""),
+        price=_f(price),
+        qty=_f(qty),
+        ts=_i(ts),
+        side=normalize_side(str(side)),
     )
 
 
-BYBIT_INTERVAL_CODE = {
-    "1m": "1",
-    "3m": "3",
-    "5m": "5",
-    "15m": "15",
-    "30m": "30",
-    "1h": "60",
-    "4h": "240",
-    "1d": "D",
-}
-_BYBIT_CODE_INTERVAL = {code: name for name, code in BYBIT_INTERVAL_CODE.items()}
+def parse_bybit_liquidation(item: dict[str, Any], symbol: str) -> Liquidation:
+    order_side = normalize_side(str(item["S"]))
+    price, qty = _f(item["p"]), _f(item["v"])
+    ts = _i(item["T"])
+    return Liquidation(
+        exchange="bybit",
+        symbol=symbol,
+        ts=ts,
+        order_side=order_side,
+        position_side=position_side_for(order_side),
+        price=price,
+        qty=qty,
+        notional=price * qty,
+        event_id=make_event_id("bybit", symbol, ts, order_side, qty, price),
+    )
 
-
-def bybit_interval_code(interval: str) -> str:
-    try:
-        return BYBIT_INTERVAL_CODE[interval]
-    except KeyError as exc:
-        raise ValueError(f"unsupported Bybit interval: {interval!r}") from exc
-
-
-def _bybit_interval_to_name(code: str) -> str:
-    return _BYBIT_CODE_INTERVAL.get(code, code)

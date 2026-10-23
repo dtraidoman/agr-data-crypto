@@ -1,25 +1,37 @@
 name: backfill
 
-# Manual, one-off deep history load. Never scheduled: this is the only job
-# that writes historical rows and it is expected to be slow.
+# Manual 5-day archive/CVD backfill. Scheduled reconciliation handles the
+# rolling window; this job exists for initial population and repairs.
 on:
   workflow_dispatch:
     inputs:
       exchange:
-        description: "Which exchange to bootstrap"
+        description: "Exchange to backfill"
         type: choice
         options: [binance, bybit, both]
-        default: binance
-      months:
-        description: "How many full months back to load"
-        type: string
-        default: "12"
+        default: both
       symbols:
         description: "Comma-separated symbols"
         type: string
         default: "BTCUSDT,ETHUSDT,SOLUSDT"
+      days:
+        description: "Rolling days to load (1..5)"
+        type: string
+        default: "5"
+      include:
+        description: "Comma-separated metrics: oi,ls,cvd"
+        type: string
+        default: "oi,ls,cvd"
+      replace_cvd:
+        description: "Overwrite CVD rows from archives"
+        type: boolean
+        default: true
+      prune:
+        description: "Prune rows older than five days"
+        type: boolean
+        default: true
       dry_run:
-        description: "Parse and count only, do not write"
+        description: "Parse only; do not write"
         type: boolean
         default: false
 
@@ -36,12 +48,13 @@ jobs:
     timeout-minutes: 350
     env:
       PYTHONPATH: src
+      PYTHONUNBUFFERED: "1"
       COLLECTOR_SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
       COLLECTOR_SUPABASE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v7
+      - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
           cache: pip
@@ -52,18 +65,26 @@ jobs:
           python -m pip install --upgrade pip
           pip install -e .
 
-      - name: Bootstrap
+      - name: Backfill
         env:
           BACKFILL_EXCHANGE: ${{ inputs.exchange }}
-          BACKFILL_MONTHS: ${{ inputs.months }}
           BACKFILL_SYMBOLS: ${{ inputs.symbols }}
+          BACKFILL_DAYS: ${{ inputs.days }}
+          BACKFILL_INCLUDE: ${{ inputs.include }}
+          BACKFILL_REPLACE_CVD: ${{ inputs.replace_cvd }}
+          BACKFILL_PRUNE: ${{ inputs.prune }}
           BACKFILL_DRY_RUN: ${{ inputs.dry_run }}
         run: |
-          args=(--exchange "$BACKFILL_EXCHANGE" --months "$BACKFILL_MONTHS" --symbols "$BACKFILL_SYMBOLS")
-          if [ "$BACKFILL_DRY_RUN" = "true" ]; then
-            args+=(--dry-run)
-          fi
-          python scripts/bootstrap_history.py "${args[@]}"
+          args=(
+            --exchange "$BACKFILL_EXCHANGE"
+            --symbols "$BACKFILL_SYMBOLS"
+            --days "$BACKFILL_DAYS"
+            --include "$BACKFILL_INCLUDE"
+          )
+          if [ "$BACKFILL_REPLACE_CVD" = "true" ]; then args+=(--replace-cvd); fi
+          if [ "$BACKFILL_PRUNE" = "true" ]; then args+=(--prune); fi
+          if [ "$BACKFILL_DRY_RUN" = "true" ]; then args+=(--dry-run); fi
+          python scripts/backfill_derivatives.py "${args[@]}"
 
       - name: Summary
         if: always()
@@ -72,8 +93,9 @@ jobs:
             echo "## backfill"
             echo ""
             echo "- exchange: ${{ inputs.exchange }}"
-            echo "- months: ${{ inputs.months }}"
+            echo "- days: ${{ inputs.days }}"
             echo "- symbols: ${{ inputs.symbols }}"
+            echo "- include: ${{ inputs.include }}"
             echo "- dry run: ${{ inputs.dry_run }}"
             echo "- conclusion: ${{ job.status }}"
           } >> "$GITHUB_STEP_SUMMARY"

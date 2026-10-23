@@ -1,31 +1,39 @@
 from __future__ import annotations
 
-import logging
-
-from .base import Sink
-
-log = logging.getLogger(__name__)
+from collections import defaultdict
+from typing import Any
 
 
-class MemorySink(Sink):
-    """In-process sink with the same dedup semantics as the SQL primary key."""
-
+class MemorySink:
     def __init__(self) -> None:
-        self.rows: dict[tuple[str, str, str, int], dict] = {}
-        self.writes = 0
-        self.duplicates = 0
+        self.tables: dict[str, dict[tuple[Any, ...], dict[str, Any]]] = defaultdict(dict)
+        self.merge_flags: list[tuple[str, bool]] = []
 
-    async def write(self, rows: list[dict]) -> int:
-        accepted = 0
+    async def write(self, table: str, rows: list[dict[str, Any]], *, merge: bool) -> None:
+        self.merge_flags.append((table, merge))
         for row in rows:
-            key = (row["exchange"], row["symbol"], row["interval"], int(row["open_time"]))
-            if key in self.rows:
-                self.duplicates += 1
-                continue
-            self.rows[key] = row
-            accepted += 1
-        self.writes += 1
-        return accepted
+            key = self._key(table, row)
+            if merge or key not in self.tables[table]:
+                self.tables[table][key] = row
 
-    async def close(self) -> None:
-        return None
+    @staticmethod
+    def _key(table: str, row: dict[str, Any]) -> tuple[Any, ...]:
+        if table == "deriv_liquidations":
+            return row["exchange"], row["event_id"]
+        if table == "deriv_long_short":
+            return row["exchange"], row["symbol"], row["kind"], row["ts"]
+        return row["exchange"], row["symbol"], row["ts"]
+
+    def rows(self, table: str) -> list[dict[str, Any]]:
+        return list(self.tables.get(table, {}).values())
+
+    async def latest_ts(self, table: str, exchange: str, symbol: str) -> int | None:
+        values = [
+            row["ts"]
+            for row in self.rows(table)
+            if row.get("exchange") == exchange and row.get("symbol") == symbol
+        ]
+        return max(values) if values else None
+
+    async def rpc(self, name: str, payload: dict[str, Any]) -> Any:
+        return {"name": name, "payload": payload}

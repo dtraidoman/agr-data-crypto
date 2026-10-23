@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "agr-data-crypto"
 version = "0.1.0"
-description = "Continuous Binance/Bybit OHLCV collection on GitHub Actions with lease-based handoff"
+description = "Five-day Binance/Bybit perpetual futures collector for open interest, long/short ratios, CVD, and liquidations"
 requires-python = ">=3.12"
 dependencies = [
     "httpx>=0.27,<1",
@@ -21,6 +21,12 @@ dev = [
     "ruff>=0.6",
     "pyyaml>=6",
 ]
+mcp = [
+    "mcp>=2,<3",
+]
+
+[project.scripts]
+agr-crypto-mcp = "collector.mcp_server:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

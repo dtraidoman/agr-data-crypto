@@ -4,123 +4,115 @@ import asyncio
 import contextlib
 import json
 import logging
-import time
-from collections import deque
 from collections.abc import Callable, Sequence
+from typing import Any
 
-from websockets.asyncio.client import connect
+import websockets
 
-from ..models import Candle
+from ..models import Liquidation, Trade
 from ..timeutil import now_ms
 from .base import backoff_seconds
-from .parsers import bybit_interval_code, parse_bybit_ws_kline
+from .parsers import parse_bybit_liquidation, parse_bybit_trade
 
 log = logging.getLogger(__name__)
 
-PING_INTERVAL_SEC = 20.0
-
 
 class BybitWs:
-    """One public spot connection; all symbols go into a single SUBSCRIBE.
-
-    Bybit requires the *client* to send {"op":"ping"} every 20 seconds.
-    Unlike Binance, the server does not ping us, and there is no automatic
-    pong: forgetting this is a guaranteed disconnect every 20-30 seconds.
-    """
-
     name = "bybit"
-    URL = "wss://stream.bybit.com/v5/public/spot"
+    WS_URL = "wss://stream.bybit.com/v5/public/linear"
 
-    def __init__(
-        self,
-        *,
-        planned_reconnect_sec: int = 6 * 3600,
-        max_backoff_sec: int = 30,
-        max_attempts_per_minute: int = 5,
-    ) -> None:
+    def __init__(self, *, planned_reconnect_sec: int = 21_600, max_backoff_sec: int = 30) -> None:
         self._planned_reconnect_sec = planned_reconnect_sec
         self._max_backoff_sec = max_backoff_sec
-        self._max_attempts_per_minute = max_attempts_per_minute
 
-    async def stream_klines(
-        self,
-        symbols: Sequence[str],
-        interval: str,
-        on_candle: Callable[[Candle], None],
-        stop: asyncio.Event,
-    ) -> None:
-        if not symbols:
-            return
-        code = bybit_interval_code(interval)
-        topics = [f"kline.{code}.{symbol}" for symbol in symbols]
-        attempt = 0
-        attempts: deque[float] = deque()
-
-        while not stop.is_set():
-            await self._pace_attempts(attempts)
-            pinger: asyncio.Task | None = None
-            try:
-                async with connect(
-                    self.URL,
-                    ping_interval=None,  # heartbeat is application-level here
-                    close_timeout=5,
-                    max_queue=2048,
-                    open_timeout=15,
-                ) as ws:
-                    await ws.send(json.dumps({"op": "subscribe", "args": topics}))
-                    pinger = asyncio.create_task(self._ping_loop(ws, stop))
-                    log.info("bybit ws connected: %s", ",".join(symbols))
-                    attempt = 0
-                    connected_at = time.monotonic()
-                    while not stop.is_set():
-                        if time.monotonic() - connected_at > self._planned_reconnect_sec:
-                            log.info("bybit planned reconnect after %ss", self._planned_reconnect_sec)
-                            break
-                        try:
-                            raw = await asyncio.wait_for(ws.recv(), timeout=5.0)
-                        except TimeoutError:
-                            continue
-                        candle = parse_bybit_ws_kline(raw, now_ms())
-                        if candle is not None:
-                            on_candle(candle)
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:  # noqa: BLE001
-                attempt += 1
-                delay = backoff_seconds(min(attempt, 6), cap=self._max_backoff_sec)
-                log.warning("bybit ws error (%s), reconnect in %.1fs", exc, delay)
-                if await _sleep_or_stop(stop, delay):
-                    return
-            finally:
-                if pinger is not None:
-                    pinger.cancel()
-                    with contextlib.suppress(asyncio.CancelledError, Exception):
-                        await pinger
-
-    async def _ping_loop(self, ws, stop: asyncio.Event) -> None:
+    async def _ping(self, ws: Any, stop: asyncio.Event) -> None:
         try:
             while not stop.is_set():
-                await asyncio.sleep(PING_INTERVAL_SEC)
+                await asyncio.sleep(20)
                 await ws.send(json.dumps({"op": "ping"}))
-        except asyncio.CancelledError:
-            raise
-        except Exception:  # noqa: BLE001 - the reader loop owns the reconnect
+        except Exception:
             return
 
-    async def _pace_attempts(self, attempts: deque[float]) -> None:
-        now = time.monotonic()
-        while attempts and now - attempts[0] > 60:
-            attempts.popleft()
-        if len(attempts) >= self._max_attempts_per_minute:
-            wait = 60 - (now - attempts[0])
-            log.warning("bybit ws attempt rate cap reached, waiting %.1fs", wait)
-            await asyncio.sleep(max(0.0, wait))
-        attempts.append(time.monotonic())
+    async def _run(
+        self,
+        topics: Sequence[str],
+        handler: Callable[[dict[str, Any]], None],
+        stop: asyncio.Event,
+        connected: asyncio.Event | None,
+    ) -> None:
+        attempt = 0
+        while not stop.is_set():
+            started = now_ms()
+            ping_task: asyncio.Task[None] | None = None
+            try:
+                async with websockets.connect(self.WS_URL, ping_interval=None, max_size=2**24) as ws:
+                    attempt = 0
+                    await ws.send(json.dumps({"op": "subscribe", "args": list(topics)}))
+                    if connected is not None:
+                        connected.set()
+                    ping_task = asyncio.create_task(self._ping(ws, stop))
+                    log.info("bybit ws connected: %s", ",".join(topics))
+                    while not stop.is_set():
+                        if now_ms() - started > self._planned_reconnect_sec * 1000:
+                            break
+                        try:
+                            raw = await asyncio.wait_for(ws.recv(), timeout=60)
+                        except TimeoutError:
+                            continue
+                        payload = json.loads(raw)
+                        if payload.get("op") in {"pong", "subscribe"} or "ret_msg" in payload:
+                            continue
+                        data = payload.get("data")
+                        if isinstance(data, dict):
+                            data = [data]
+                        if isinstance(data, list):
+                            for item in data:
+                                if isinstance(item, dict):
+                                    handler(item)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                attempt += 1
+                log.warning("bybit ws error: %s", exc)
+                await asyncio.sleep(backoff_seconds(attempt, self._max_backoff_sec))
+            finally:
+                if ping_task is not None:
+                    ping_task.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await ping_task
 
+    async def stream_trades(
+        self,
+        symbols: Sequence[str],
+        on_trade: Callable[[Trade], None],
+        stop: asyncio.Event,
+        connected: asyncio.Event | None = None,
+    ) -> None:
+        topics = [f"publicTrade.{symbol.upper()}" for symbol in symbols]
 
-async def _sleep_or_stop(stop: asyncio.Event, delay: float) -> bool:
-    try:
-        await asyncio.wait_for(stop.wait(), timeout=delay)
-        return True
-    except TimeoutError:
-        return False
+        def handler(item: dict[str, Any]) -> None:
+            try:
+                symbol = str(item.get("s", "")).upper()
+                on_trade(parse_bybit_trade(item, symbol))
+            except (KeyError, ValueError, TypeError):
+                log.debug("bad bybit trade payload", exc_info=True)
+
+        await self._run(topics, handler, stop, connected)
+
+    async def stream_liquidations(
+        self,
+        symbols: Sequence[str],
+        on_liquidation: Callable[[Liquidation], None],
+        stop: asyncio.Event,
+        connected: asyncio.Event | None = None,
+    ) -> None:
+        topics = [f"allLiquidation.{symbol.upper()}" for symbol in symbols]
+
+        def handler(item: dict[str, Any]) -> None:
+            try:
+                symbol = str(item.get("s", "")).upper()
+                on_liquidation(parse_bybit_liquidation(item, symbol))
+            except (KeyError, ValueError, TypeError):
+                log.debug("bad bybit liquidation payload", exc_info=True)
+
+        await self._run(topics, handler, stop, connected)

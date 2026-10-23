@@ -1,0 +1,62 @@
+name: reconcile
+
+# Daily archive reconciliation. The previous UTC day is rebuilt from exchange
+# archives, overwriting live CVD buckets so gaps and duplicates self-heal.
+on:
+  schedule:
+    # Wait until both daily archives are normally published. The backfill
+    # fails loudly if a completed UTC day is still missing.
+    - cron: "20 4 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: reconcile
+  cancel-in-progress: false
+
+jobs:
+  reconcile:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    env:
+      PYTHONPATH: src
+      PYTHONUNBUFFERED: "1"
+      COLLECTOR_SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+      COLLECTOR_SUPABASE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e .
+
+      - name: Reconcile previous UTC day
+        run: |
+          start="$(date -u -d 'yesterday' +%Y-%m-%dT00:00:00Z)"
+          end="$(date -u +%Y-%m-%dT00:00:00Z)"
+          python scripts/backfill_derivatives.py \
+            --exchange both \
+            --symbols BTCUSDT,ETHUSDT,SOLUSDT \
+            --start "$start" \
+            --end "$end" \
+            --include oi,ls,cvd \
+            --replace-cvd \
+            --prune
+
+      - name: Verify reconciled UTC day
+        run: |
+          start="$(date -u -d 'yesterday' +%Y-%m-%dT00:00:00Z)"
+          end="$(date -u +%Y-%m-%dT00:00:00Z)"
+          python scripts/verify_continuity.py --start "$start" --end "$end"
+
+      - name: Verify live continuity
+        run: python scripts/verify_continuity.py --window-minutes 260
