@@ -123,6 +123,36 @@ async def test_rest_seed_catches_up_closed_minutes() -> None:
     assert cursors == {"BTCUSDT": BASE}
 
 
+async def test_rest_seed_conservative_path_drops_partial_first_minute() -> None:
+    sink = MemorySink()
+    pipeline = Pipeline(sink)
+    rest = FakeRest(
+        [trade(-600_000 + 40_000)]
+        + [trade(-540_000 + minute * 60_000 + 5_000) for minute in range(9)]
+    )
+    stream = RestCvdStream(
+        rest=rest,
+        sink=sink,
+        pipeline=pipeline,
+        exchange="binance",
+        symbols=["BTCUSDT"],
+        seed_lookback_min=10,
+        assume_full_range=False,
+    )
+
+    cursors = await stream._seed(BASE + 30_000)
+    await pipeline.flush()
+
+    rows = sorted(sink.rows("deriv_cvd_1m"), key=lambda row: row["ts"])
+    # Bybit-style pages can start mid-minute, so the first partial bucket is
+    # dropped even though the request started at the seed floor.
+    assert [row["ts"] for row in rows] == [
+        BASE - 540_000 + minute * 60_000 for minute in range(9)
+    ]
+    assert all(row["trades"] == 1 for row in rows)
+    assert cursors == {"BTCUSDT": BASE}
+
+
 async def test_rest_poll_writes_only_the_closed_minute() -> None:
     sink = MemorySink()
     pipeline = Pipeline(sink)
