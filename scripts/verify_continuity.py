@@ -180,8 +180,20 @@ async def amain() -> int:
     parser.add_argument("--start", help="ISO-8601 UTC inclusive; requires --end")
     parser.add_argument("--end", help="ISO-8601 UTC exclusive; requires --start")
     parser.add_argument("--json", action="store_true")
+    parser.add_argument(
+        "--tables",
+        default=",".join(STEP_MS),
+        help="Comma-separated tables to check (default: all)",
+    )
     args = parser.parse_args()
 
+    tables = tuple(part.strip() for part in args.tables.split(",") if part.strip())
+    unknown = sorted(set(tables) - set(STEP_MS))
+    if not tables or unknown:
+        parser.error(
+            f"--tables must be a non-empty subset of {','.join(STEP_MS)}; "
+            f"unknown={','.join(unknown) or '-'}"
+        )
     if bool(args.start) != bool(args.end):
         parser.error("--start and --end must be used together")
     if args.window_minutes <= 0:
@@ -213,7 +225,7 @@ async def amain() -> int:
 
     checks: list[Check] = []
     async with httpx.AsyncClient() as client:
-        for table in STEP_MS:
+        for table in tables:
             if mode == "history":
                 assert end_ms is not None
                 grid_start, grid_last = _range_start(STEP_MS, table, start_ms, end_ms)

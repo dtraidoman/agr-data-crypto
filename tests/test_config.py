@@ -58,3 +58,15 @@ def test_invalid_role_fails_fast(monkeypatch: pytest.MonkeyPatch) -> None:
 
     with pytest.raises(ValueError):
         Settings.from_env()
+
+
+def test_from_env_cvd_rest_fallback(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("COLLECTOR_CVD_REST_EXCHANGES", "BINANCE, bybit")
+    monkeypatch.setenv("COLLECTOR_CVD_POLL_SEC", "20")
+    monkeypatch.setenv("COLLECTOR_CVD_SEED_LOOKBACK_MIN", "60")
+
+    settings = Settings.from_env()
+
+    assert settings.cvd_rest_exchanges == ("binance", "bybit")
+    assert settings.cvd_poll_sec == 20
+    assert settings.cvd_seed_lookback_min == 60

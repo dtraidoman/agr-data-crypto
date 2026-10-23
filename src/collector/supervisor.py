@@ -11,7 +11,7 @@ from .models import Stream
 from .notify import Notifier
 from .pipeline import Pipeline, Sink
 from .state.manager import NullState, StateManager
-from .streams import CvdStream, LiquidationStream, MetricsPoller
+from .streams import CvdStream, LiquidationStream, MetricsPoller, RestCvdStream
 
 log = logging.getLogger(__name__)
 
@@ -150,6 +150,18 @@ class Supervisor:
     async def _run_stream(self, stream: Stream, stop: asyncio.Event) -> None:
         settings = self._settings
         if stream.kind == "cvd":
+            if stream.exchange in settings.cvd_rest_exchanges:
+                await RestCvdStream(
+                    self._rests[stream.exchange],
+                    self._sink,
+                    self._pipeline,
+                    stream.exchange,
+                    settings.symbols,
+                    poll_sec=settings.cvd_poll_sec,
+                    seed_lookback_min=settings.cvd_seed_lookback_min,
+                    assume_full_range=stream.exchange == "binance",
+                ).run(stop)
+                return
             await CvdStream(
                 self._wss[stream.exchange],
                 self._rests[stream.exchange],

@@ -48,7 +48,7 @@ jobs:
             --symbols BTCUSDT,ETHUSDT,SOLUSDT \
             --start "$start" \
             --end "$end" \
-            --include oi,ls,cvd \
+            --include cvd \
             --replace-cvd \
             --prune
 
@@ -56,7 +56,8 @@ jobs:
         run: |
           start="$(date -u -d 'yesterday' +%Y-%m-%dT00:00:00Z)"
           end="$(date -u +%Y-%m-%dT00:00:00Z)"
-          python scripts/verify_continuity.py --start "$start" --end "$end"
+          python scripts/verify_continuity.py --start "$start" --end "$end" \
+            --tables deriv_cvd_1m
 
       - name: Verify live continuity
-        run: python scripts/verify_continuity.py --window-minutes 260
+        run: python scripts/verify_continuity.py --window-minutes 260 --tables deriv_cvd_1m

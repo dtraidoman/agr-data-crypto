@@ -41,12 +41,21 @@ def _csv(name: str, default: str) -> tuple[str, ...]:
     return tuple(part.strip().upper() for part in raw.split(",") if part.strip())
 
 
+def _csv_lower(name: str, default: str) -> tuple[str, ...]:
+    raw = _str(name, default)
+    return tuple(part.strip().lower() for part in raw.split(",") if part.strip())
+
+
 @dataclass(slots=True)
 class Settings:
     role: Role = Role.ALPHA
     run_id: str = field(default_factory=lambda: f"{socket.gethostname()}-{os.getpid()}")
     symbols: tuple[str, ...] = ("BTCUSDT", "ETHUSDT", "SOLUSDT")
     enable_liquidations: bool = True
+    # Venues whose websocket data plane is unreachable: poll trades over REST.
+    cvd_rest_exchanges: tuple[str, ...] = ()
+    cvd_poll_sec: int = 15
+    cvd_seed_lookback_min: int = 10
 
     redis_url: str = ""
     supabase_url: str = ""
@@ -88,6 +97,9 @@ class Settings:
             run_id=run_id,
             symbols=_csv(f"{prefix}SYMBOLS", "BTCUSDT,ETHUSDT,SOLUSDT"),
             enable_liquidations=_bool(f"{prefix}ENABLE_LIQUIDATIONS", True),
+            cvd_rest_exchanges=_csv_lower(f"{prefix}CVD_REST_EXCHANGES", ""),
+            cvd_poll_sec=_int(f"{prefix}CVD_POLL_SEC", 15),
+            cvd_seed_lookback_min=_int(f"{prefix}CVD_SEED_LOOKBACK_MIN", 10),
             redis_url=_str(f"{prefix}REDIS_URL"),
             supabase_url=_str(f"{prefix}SUPABASE_URL").rstrip("/"),
             supabase_key=_str(f"{prefix}SUPABASE_KEY"),

@@ -42,6 +42,9 @@ class BinanceRest:
         self._limiter = limiter
         self._max_retries = max_retries
         self._max_pages = max_pages
+        # aggTrades carries weight 20; 0.6s between pages keeps catch-up
+        # under the 2400 weight/minute IP budget.
+        self._trade_limiter = AsyncRateLimiter(0.6)
 
     async def _get(self, path: str, params: dict[str, Any]) -> Any:
         url = f"{self.BASE}{path}"
@@ -147,6 +150,7 @@ class BinanceRest:
         end = min(end_ms, now_ms())
         from_id: int | None = None
         for _ in range(self._max_pages):
+            await self._trade_limiter.wait()
             params: dict[str, Any] = {"symbol": symbol, "limit": 1000}
             if from_id is None:
                 params["startTime"] = start_ms
