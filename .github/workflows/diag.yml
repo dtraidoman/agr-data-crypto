@@ -1,0 +1,40 @@
+name: diag
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  diag:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: HTTP endpoints
+        run: |
+          check() {
+            code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 20 -r 0-0 "$1" || true)
+            echo "$code  $1"
+          }
+          check "https://fapi.binance.com/fapi/v1/ping"
+          check "https://fapi1.binance.com/fapi/v1/ping"
+          check "https://fapi2.binance.com/fapi/v1/ping"
+          check "https://data.binance.vision/data/futures/um/daily/aggTrades/BTCUSDT/BTCUSDT-aggTrades-2026-10-22.zip"
+          check "https://api.bybit.com/v5/market/time"
+          check "https://api.bytick.com/v5/market/time"
+          check "https://public.bybit.com/trading/BTCUSDT/BTCUSDT2026-10-22.csv.gz"
+
+      - name: WebSocket handshakes
+        run: |
+          ws() {
+            code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 \
+              -H "Connection: Upgrade" \
+              -H "Upgrade: websocket" \
+              -H "Sec-WebSocket-Version: 13" \
+              -H "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==" \
+              "$1" || true)
+            echo "$code  $1"
+          }
+          ws "https://fstream.binance.com/ws"
+          ws "https://stream.bybit.com/v5/public/linear"
