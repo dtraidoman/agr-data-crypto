@@ -1,9 +1,11 @@
 # AGR-DATA-CRYPTO
 
 Zero-budget derivatives data collector for Binance and Bybit USDT perpetual
-futures. It runs as an A/B pair of GitHub Actions jobs, stores a rolling
-five-day window in Supabase Postgres, and uses Upstash Redis only for ownership
-leases and heartbeats.
+futures. Live collection runs on an always-on local host (Windows, Linux, or a
+small VPS) because GitHub-hosted runners are geo-blocked from the exchange
+APIs; GitHub Actions handles archive backfills and the daily reconciliation.
+Data is stored in Supabase Postgres with a rolling five-day window. Upstash
+Redis is optional and is used only for A/B ownership leases when configured.
 
 The collector covers `BTCUSDT`, `ETHUSDT`, and `SOLUSDT`:
 
@@ -17,70 +19,77 @@ The collector covers `BTCUSDT`, `ETHUSDT`, and `SOLUSDT`:
 There is no OHLCV collection. CVD is built from actual taker-classified trades,
 not from candle approximations.
 
+## Deployment modes
+
+- **Local host (current).** The two roles run on an always-on Windows PC and
+  start automatically from the user's Startup folder. This is the mode that
+  receives live CVD, OI, long/short, and liquidation data.
+- **GitHub Actions.** `backfill` and `reconcile` run in the cloud because they
+  download exchange archives rather than call the exchange REST APIs. The
+  scheduled `collect-a`, `collect-b`, and `watchdog` workflows are disabled;
+  enabling them on a geo-blocked runner produces no live data.
+- **VPS / Oracle Cloud Always Free.** The same collector can run on a small
+  always-on Linux VM for independence from the desktop. Use the Docker image or
+  a Python virtualenv with a systemd unit.
+
+The GitHub-side workflows are:
+
+| Workflow | Status | Purpose |
+| --- | --- | --- |
+| `collect-a.yml`, `collect-b.yml` | disabled | former GitHub-hosted live collectors |
+| `watchdog.yml` | disabled | former collector dispatcher |
+| `backfill.yml` | manual | initial five-day load or targeted repair |
+| `reconcile.yml` | daily, 04:20 UTC | rebuild the previous UTC day from archives, prune, verify |
+| `keepalive.yml` | monthly | keep scheduled workflows from being disabled |
+| `ci.yml` | push / PR | tests, lint, and workflow checks |
+
+The collector workflows are disabled because GitHub-hosted runners cannot reach
+the exchange APIs from their network. `reconcile` remains active: it only
+downloads public archives and talks to Supabase.
+
 ## Architecture
 
 ```
-GitHub Actions                         Upstash Redis
-┌─────────────────────┐               ┌──────────────────────┐
-│ collect-a (alpha)   │  leases /     │ hb:alpha             │
-│ primary: Binance    │  heartbeats   │ hb:bravo             │
-│ secondary: Bybit    │◄─────────────►│ lease:cvd:binance    │
-└─────────┬───────────┘               │ lease:cvd:bybit      │
-          │                           │ lease:liq:*          │
-          │                           └──────────────────────┘
-          │ idempotent upserts
-          ▼
-┌─────────────────────┐               ┌──────────────────────┐
-│ collect-b (bravo)   │               │ Supabase Postgres    │
-│ primary: Bybit      │──────────────►│ four derivative      │
-│ secondary: Binance  │               │ tables + views       │
-└─────────────────────┘               └──────────────────────┘
+Local host / VPS                          Supabase Postgres
+┌──────────────────────────────┐          ┌──────────────────────────┐
+│ alpha: Binance REST + WS     │ upserts  │ deriv_open_interest      │
+│ bravo: Bybit WS              │─────────▶│ deriv_long_short         │
+└──────────────────────────────┘          │ deriv_cvd_1m             │
+                                          │ deriv_liquidations       │
+GitHub Actions (archive jobs)             │ + 5-minute views         │
+┌──────────────────────────────┐          │                          │
+│ backfill / reconcile         │─────────▶│                          │
+└──────────────────────────────┘          └──────────────────────────┘
 ```
 
-- `alpha` owns the Binance CVD and liquidation WebSockets.
-- `bravo` owns the Bybit CVD and liquidation WebSockets.
-- Both roles poll OI and long/short data idempotently. Duplicate writes are
+- `alpha` collects Binance: OI, long/short, CVD, and the liquidation feed.
+- `bravo` collects Bybit: OI, long/short, CVD, and liquidations.
+- Both roles poll OI and long/short idempotently. Duplicate writes are
   harmless because every table has an exchange/symbol/timestamp primary key.
-- If the peer heartbeat disappears, the surviving role can take over the
-  missing exchange. When Redis is unavailable, each role still collects its
-  primary exchange, so the pair continues to cover both exchanges.
-- Leases are fenced with a Redis `INCR` value. A stale owner cannot overwrite a
-  newer owner's lease.
-- Heartbeat interval is 60 seconds and lease TTL is 180 seconds. The 60-second
-  takeover poll keeps normal Upstash usage below the free command quota.
+- With Redis configured, the roles use leases and heartbeats for failover.
+  Without Redis (the current local deployment), each role runs only its
+  primary exchange's live streams.
 - The writer pipeline deduplicates rows in memory, flushes in batches, and
   retries a failed batch on the next flush.
 
 ### Ownership and shutdown
 
-Each collector job has a soft deadline of 4 hours 30 minutes (`16,200` seconds)
-and a GitHub hard timeout of 350 minutes. The schedules repeat every four hours,
-so the successor starts 30 minutes before its predecessor exits and waits on the
-exchange stream leases. The predecessor keeps streaming until its deadline and
-then releases the leases; the successor acquires them on its next 60-second
-poll. This deliberate overlap absorbs GitHub schedule jitter and avoids a
-10-minute hole at every handoff. Primary-key upserts make the brief overlap
-safe.
+The live roles are ordinary long-running processes. On Windows, two hidden
+PowerShell wrappers start one process per role and restart it after a crash;
+a stop flag allows a clean shutdown. Logs are rotated daily. On a VPS, use
+systemd units or a process supervisor with the same restart semantics.
 
-Do not add a GitHub `concurrency` group that queues the successor behind the
-predecessor: that turns the overlap into an outage. The Redis leases, not the
-workflow queue, arbitrate ownership.
+Upstash Redis is optional. When it is configured, each role publishes a
+heartbeat and takes a lease for the streams it owns; the peer can take over a
+missing exchange after the lease expires. The lease is fenced with a Redis
+`INCR` value, so a stale owner cannot overwrite a newer owner. When Redis is
+not configured, alpha owns Binance and bravo owns Bybit, and neither role
+attempts a takeover.
 
-The schedules are:
-
-| Workflow | Schedule (UTC) | Purpose |
-| --- | --- | --- |
-| `collect-a.yml` | `0 */4 * * *` | alpha, primary Binance |
-| `collect-b.yml` | `10 */4 * * *` | bravo, primary Bybit |
-| `watchdog.yml` | `*/15 * * * *` | dispatch a collector when its heartbeat is missing |
-| `reconcile.yml` | `20 4 * * *` | rebuild the previous UTC day from archives, prune, verify the rebuilt day and live continuity |
-| `keepalive.yml` | monthly | prevent GitHub from disabling scheduled workflows |
-| `backfill.yml` | manual | initial five-day load or targeted repair |
-| `ci.yml` | push / PR | tests, lint, and workflow checks |
-
-If both collector heartbeats are absent, the watchdog dispatches both
-collectors instead of waiting for manual intervention. It needs the repository
-`GITHUB_TOKEN` with permission to dispatch workflows.
+Do not run two copies of the same role against the same Redis key space. With
+Redis disabled, do not start a second alpha/bravo pair on the same host: the
+duplicate streams are idempotently written, but they waste exchange rate limit
+and can create misleading gaps during restarts.
 
 ## Data model
 
@@ -148,13 +157,16 @@ select public.prune_derivatives(5);
 
 - Binance `aggTrades` uses the `m` flag to determine the taker side. Bybit
   `publicTrade` and the public archive expose the taker side directly.
-- The live CVD stream starts the WebSocket first, buffers trades while it warms
-  up from REST, then aggregates the still-open minute from both REST and the
-  buffered stream. Completed minutes are persisted by the normal flush.
+- Bybit's live CVD stream starts the WebSocket first, buffers trades while it
+  warms up from REST, then aggregates the still-open minute from both sources.
+  Binance, when `COLLECTOR_CVD_REST_EXCHANGES=binance` is set, seeds from
+  `aggTrades` and then polls the just-closed minute over REST.
 - Binance REST recent trades stop after 30,000 trades. Bybit REST recent trades
   return at most 1,000 trades. A warmup longer than those pages can leave a
   current-day gap; the next daily archive reconciliation replaces the entire
-  previous UTC day and repairs it.
+  previous UTC day and repairs it. The Binance seed is chunked into 10-minute
+  windows and paced at 0.6 seconds per page, so a long catch-up stays under the
+  exchange weight limit.
 - Daily reconciliation downloads Binance Vision `aggTrades` and Bybit public
   trade archives, rebuilds every minute including zero-volume minutes, and
   overwrites existing CVD rows with `source = archive`.
@@ -166,12 +178,16 @@ select public.prune_derivatives(5);
   `open_interest_value` is `null` for Bybit.
 - Bybit's recent-trades endpoint returns at most 1,000 trades, which may cover
   less than one minute for BTCUSDT. Its live warmup therefore usually starts at
-  the current minute, not ten minutes back. Normal A/B handoffs are covered by
-  the 30-minute job overlap; a longer unexpected outage leaves a current-day
-  Bybit CVD gap that the next daily archive reconciliation repairs.
-- GitHub Actions scheduled jobs can start late. The watchdog exists to reduce
-  the resulting gaps; the A/B overlap and next-day reconciliation provide the
-  second layer of recovery.
+  the current minute, not ten minutes back. A restart can leave a short
+  current-day Bybit CVD gap; the next daily archive reconciliation repairs it.
+- The local wrappers restart a crashed collector after a short delay, but a
+  restart still loses the seconds between the crash and the new process. The
+  next daily archive reconciliation rebuilds the previous UTC day and repairs
+  those gaps.
+- Binance's trade WebSocket data plane is silent from some networks. The REST
+  fallback (`COLLECTOR_CVD_REST_EXCHANGES=binance`) is the supported workaround.
+  Binance liquidations have no usable public REST history, so that table stays
+  empty for Binance in this mode.
 
 ## Setup
 
@@ -182,7 +198,10 @@ select public.prune_derivatives(5);
 3. Copy the project URL and the `service_role` key. Keep the service-role key
    private: it bypasses RLS.
 
-### 2. Create Upstash Redis
+### 2. (Optional) Create Upstash Redis
+
+Redis is not required for the current local deployment. Skip this step unless
+you want automatic A/B failover between two roles.
 
 1. Create a free Upstash Redis database.
 2. Copy the TLS connection URL (`rediss://...`).
@@ -196,13 +215,15 @@ In the repository settings, add:
 | --- | --- | --- |
 | `SUPABASE_URL` | yes | Supabase project URL |
 | `SUPABASE_SERVICE_ROLE_KEY` | yes | Supabase service-role key |
-| `UPSTASH_REDIS_URL` | yes | Upstash TLS Redis URL |
+| `UPSTASH_REDIS_URL` | no | Upstash TLS Redis URL (optional; enables A/B leases) |
 | `TELEGRAM_BOT_TOKEN` | no | Telegram bot token for failure notices |
 | `TELEGRAM_CHAT_ID` | no | Telegram chat ID for failure notices |
 
 Never put these values in a tracked file or commit message. The application
 uses public Binance/Bybit market-data endpoints, so exchange API keys are not
-required.
+required. The two Supabase secrets are required for the archive workflows.
+Redis is optional. For local live collection, keep the same values in a
+private environment file; `.env.local` is gitignored.
 
 ### 4. Initial backfill
 
@@ -220,10 +241,34 @@ Liquidations cannot be backfilled.
 
 ### 5. Start collection
 
-Enable the scheduled workflows (`collect-a`, `collect-b`, `watchdog`,
-`reconcile`) and run `collect-a` and `collect-b` once manually if you do not
-want to wait for the next cron tick. A/B ownership is established through
-Upstash.
+The current deployment starts both roles locally. Set the environment from a
+private file and launch one process per role; the repository's `.env.example`
+lists the supported variables. A minimal pair is:
+
+```powershell
+$env:PYTHONPATH = "src"
+$env:COLLECTOR_ROLE = "alpha"   # use "bravo" for the Bybit process
+$env:COLLECTOR_SYMBOLS = "BTCUSDT,ETHUSDT,SOLUSDT"
+$env:COLLECTOR_SUPABASE_URL = "https://your-project.supabase.co"
+$env:COLLECTOR_SUPABASE_KEY = "service-role-key"
+.\.venv\Scripts\python.exe -m collector.main
+```
+
+Run `alpha` and `bravo` as separate, supervised processes. On Windows, place a
+shortcut to the start script in `shell:startup`. On Linux, use two systemd
+units with `Restart=always`. Do not commit the environment file or the
+service-role key.
+
+For the Binance CVD workaround used on networks where the trade WebSocket is
+silent, set `COLLECTOR_CVD_REST_EXCHANGES=binance`. The collector then seeds and
+polls `aggTrades` over REST, paced at 0.6 seconds per page. This setting is
+local-only; it is not required for the archive workflows.
+
+Keep the host awake and connected. The two roles are independent processes:
+alpha owns Binance and bravo owns Bybit when Redis is not configured. The
+Windows wrappers in the current deployment live outside the repository; they
+clear a stop flag on start, set it on stop, rotate logs daily, and restart a
+crashed process. On Linux, use two systemd units with `Restart=always`.
 
 ### 6. Verify
 
@@ -315,7 +360,7 @@ $env:PYTHONPATH = "src"
 ### Docker
 
 The Docker image is a portable single-role runner. Run one container per role
-when a VPS or Oracle Cloud Always Free instance replaces GitHub Actions.
+when moving live collection to a VPS or an Oracle Cloud Always Free instance.
 
 ```powershell
 docker build -t agr-data-crypto -f docker/Dockerfile .
