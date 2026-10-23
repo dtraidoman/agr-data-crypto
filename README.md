@@ -368,22 +368,24 @@ docker run --env-file .env agr-data-crypto
 ```
 
 The image defaults to `COLLECTOR_ROLE=alpha`; set `COLLECTOR_ROLE=bravo` for the
-second container. Both containers should use the same Redis URL.
+second container. When Redis is enabled, both containers should use the same
+URL so lease handoff works. Without Redis, run one alpha container and one
+bravo container; each owns its primary exchange.
 
 ## Cost
 
 The intended deployment is zero-budget:
 
-- **GitHub Actions:** standard runners are free for a public repository. The
-  30-minute handoff overlap means each role runs about 27 hours per day, or
-  roughly 54 runner-hours for the pair. A private repository consumes the
-  account's included Actions minutes, which this design will exhaust quickly;
-  use a public repository for the zero-budget target.
+- **Local live collection:** the only cost is the always-on host's electricity
+  and network. No cloud compute is required for the live streams.
+- **GitHub Actions:** the archive workflows and CI run on standard runners,
+  which are free for a public repository. They consume minutes only during
+  backfill/reconcile, not around the clock.
 - **Supabase Free:** the five-day window is roughly tens of thousands of rows,
   well below the free database limit.
-- **Upstash Free:** heartbeats and takeover polls are intentionally paced to
-  stay within the daily command quota. Watchdog and reconciliation add only a
-  small number of commands.
+- **Upstash Free (optional):** heartbeats and takeover polls are intentionally
+  paced to stay within the daily command quota. The local deployment without
+  Redis uses no Upstash commands at all.
 
 Archive backfills use GitHub runner bandwidth and disk, not paid storage.
 
@@ -438,8 +440,8 @@ server connects automatically when OpenCode starts.
 ## Security
 
 - No exchange API keys are used.
-- Supabase service-role credentials and Upstash URLs must stay in GitHub
-  Secrets or a local, untracked environment.
+- Supabase service-role credentials and, if used, Upstash URLs must stay in
+  GitHub Secrets or a local, untracked environment.
 - The schema revokes table and view access from `anon` and `authenticated`;
   only `service_role` can read or write.
 - `.env` is ignored by Git. Never commit a populated environment file.
@@ -451,10 +453,15 @@ server connects automatically when OpenCode starts.
 Before leaving a deployment unattended:
 
 1. `ci.yml` is green.
-2. Supabase contains rows in all four tables.
-3. `verify_continuity.py --window-minutes 260` exits with code 0.
-4. `collect-a` and `collect-b` both show heartbeats in Upstash.
-5. The watchdog can dispatch a missing collector.
+2. Supabase contains rows in all four tables. Bybit liquidations are sparse by
+   nature; Binance liquidations stay empty when the WebSocket data plane is
+   silent.
+3. `verify_continuity.py --window-minutes 30 --tables deriv_cvd_1m` exits with
+   code 0.
+4. The local alpha and bravo processes are running, and the Startup folder
+   entry exists on Windows.
+5. The logs show no repeated 429s or tracebacks, and OI/long-short timestamps
+   advance every five minutes.
 6. The next daily reconciliation completes, leaves `source = archive` rows for
    the previous UTC day, and `verify_continuity.py --start <yesterday>
    --end <today>` exits with code 0.
